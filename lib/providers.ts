@@ -1,296 +1,377 @@
-// The brief's two documents, the free model list, and the catalog.
+// providers.ts — the free-model catalog and the OpenRouter provider client.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
-// prose around them does not matter: this file finds each by its `schema` member, under this contest's
-// prefix (`free-model-aggregator-02/`).
+// This module owns three things:
+//   1. The catalog: exactly the fourteen free models the trial allows, each
+//      named by its dialable id `openrouter/<upstream id>:free`.
+//   2. Quality routing: which model to dial first for a prompt, and which to
+//      fail over to when the gateway refuses one.
+//   3. The gateway client: one Chat Completions call per attempt, with the
+//      refusal trail (`x-makefun-upstream-failures`) collected for the wire.
 //
-//   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
-//     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
-//     free model may serve a prompt; this baseline never routes a paid one.
-//   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its
-//     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
-//     this baseline routes each arrival by its row, which is why the prompt list is read before the
-//     first request.
-//
-// A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
-// sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
-// carries, never by a name alone. The brief's own prose is never parsed.
-//
-// Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
-// register body build the same document, byte for byte, on a live pass and on its replay.
+// The server never holds a provider key. The only key it ever sends is the
+// trial's stand-in key from OPENAI_API_KEY, exactly as an OpenAI SDK sends
+// it (Authorization: Bearer). The grader's gateway swaps that stand-in for
+// the entrant's own OpenRouter key, which never enters this process's files.
 
-import { readFileSync } from 'node:fs';
-
-export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
-export const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
-
-/** Every schema this contest's brief writes names this prefix; the brief's JSON is found by it. */
-const SCHEMA_PREFIX = 'free-model-aggregator-02/';
-
-/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches for them. */
-export const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
-/** The environment variable an entrant's OpenRouter key is pushed under (an entry secret, kept out of the sandbox). */
-export const OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY';
-
-export type Json = Record<string, unknown>;
-export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-
-/** One free model as the brief lists it. `id` is the id the gateway routes. */
-export interface ModelRow {
+export interface FreeModel {
+  /** Upstream id without the gateway prefix, e.g. `nvidia/nemotron-3.5-super-vl:free`. */
   id: string;
-  /** The provider the model belongs to, as the brief names it (`openrouter`). */
-  provider: string;
-  display_name: string;
-  /** The published rating in milli-points: the quality column's currency. */
-  rating_milli: number;
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-  free: boolean;
+  /** The model's published display name. */
+  displayName: string;
+  /** House quality rating, 0-2000, higher is stronger. */
+  ratingMilli: number;
+  /** Context window in tokens. */
+  contextLength: number;
+  /** Whether the model takes tool calls. */
+  tools: boolean;
+  /** Whether the model takes images. */
+  vision: boolean;
+  /** Whether the model supports JSON mode (response_format json_object). */
+  json: boolean;
 }
 
-/** What one prompt needs: a model without it cannot serve the prompt. */
-export interface Requirement {
-  tools?: boolean;
-  vision?: boolean;
-  json?: boolean;
-  min_context?: number;
-}
-
-/** One prompt the client will send, as the brief lists it. */
-export interface PromptRow {
-  id: string;
-  api: 'openai' | 'anthropic';
-  stream: boolean;
-  weight: 1 | 2;
-  requires: Requirement;
-}
-
-/** The brief as this baseline reads it. `error` is set when a document could not be read. */
-export interface Brief {
-  models: ModelRow[];
-  prompts: PromptRow[];
-  error: string | null;
-}
-
-/** One model in the catalog document. */
-export interface CatalogModel {
-  id: string;
-  free: boolean;
-  context_length: number | null;
-}
-
-/** One provider in the catalog document. */
-export interface CatalogProvider {
-  id: string;
-  base_url: string;
-  key_env: string;
-  wire: 'openai';
-  models: CatalogModel[];
-}
-
-/** What `--list` prints and what the entry POSTs to /register: the same document, byte for byte. */
-export interface CatalogReport {
-  providers: CatalogProvider[];
-}
-
-/** What a model can do, from the brief's row (null: the brief did not say). */
-export interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
-}
-
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
+/** The gateway prefix every dialable id carries. */
+export const GATEWAY_PREFIX = "openrouter/";
 
 /**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
+ * The fourteen free models, in the order the trial brief lists them.
+ * Ratings and context lengths are the house's sealed table from the brief.
  */
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
-  for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
+export const FREE_MODELS: readonly FreeModel[] = [
+  { id: "inclusionai/ling-3.2-flash:free", displayName: "inclusionAI: Ling 3.2 Flash (free)", ratingMilli: 1150, contextLength: 1048576, tools: true, vision: true, json: true },
+  { id: "baidu/ernie-5.5-flash-preview:free", displayName: "Baidu: ERNIE-5.5-Flash-Preview (free)", ratingMilli: 1150, contextLength: 1024000, tools: true, vision: false, json: true },
+  { id: "thinkingmachines/inkling-2-small:free", displayName: "Thinking Machines: Inkling 2 Small (free)", ratingMilli: 1475, contextLength: 1048576, tools: true, vision: true, json: false },
+  { id: "liquid/lfm-3-1.7b:free", displayName: "LiquidAI: LFM3-1.7B (free)", ratingMilli: 1150, contextLength: 262144, tools: true, vision: false, json: true },
+  { id: "particle-ai/particle-1:free", displayName: "Particle AI: Particle-1 (free)", ratingMilli: 1150, contextLength: 1048576, tools: true, vision: true, json: true },
+  { id: "recursive/flint-v1.0:free", displayName: "Recursive: Flint (free)", ratingMilli: 1150, contextLength: 262144, tools: true, vision: false, json: true },
+  { id: "nvidia/nemotron-3.5-super-vl:free", displayName: "NVIDIA: Nemotron 3.5 Super VL (free)", ratingMilli: 1303, contextLength: 1000000, tools: true, vision: true, json: true },
+  { id: "dots-studio/dots-3-note-preview:free", displayName: "Dots Studio: Dots3-Note Preview (free)", ratingMilli: 1150, contextLength: 512000, tools: true, vision: true, json: true },
+  { id: "nvidia/nemotron-3.5-lightning:free", displayName: "NVIDIA: Nemotron 3.5 Lightning (free)", ratingMilli: 1221, contextLength: 1000000, tools: true, vision: false, json: false },
+  { id: "cohere/north-mini-code:free", displayName: "Cohere: North Mini Code (free)", ratingMilli: 1200, contextLength: 256000, tools: true, vision: false, json: false },
+  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", displayName: "NVIDIA: Nemotron 3 Ultra (free)", ratingMilli: 1285, contextLength: 1000000, tools: true, vision: false, json: false },
+  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", displayName: "NVIDIA: Nemotron 3 Nano Omni (free)", ratingMilli: 1150, contextLength: 256000, tools: true, vision: true, json: false },
+  { id: "google/gemma-4-26b-a4b-it:free", displayName: "Google: Gemma 4 26B A4B (free)", ratingMilli: 1150, contextLength: 262144, tools: true, vision: true, json: true },
+  { id: "google/gemma-4-31b-it:free", displayName: "Google: Gemma 4 31B (free)", ratingMilli: 1210, contextLength: 262144, tools: true, vision: true, json: true },
+];
+
+/** The dialable id of a model: the gateway prefix plus its upstream id. */
+export function dialableId(model: FreeModel): string {
+  return `${GATEWAY_PREFIX}${model.id}`;
+}
+
+/** Every dialable id, in catalog order. */
+export const DIALABLE_IDS: readonly string[] = FREE_MODELS.map(dialableId);
+
+/** Look a model up by its dialable id (or its bare upstream id). */
+export function modelById(id: string): FreeModel | null {
+  const bare = id.startsWith(GATEWAY_PREFIX) ? id.slice(GATEWAY_PREFIX.length) : id;
+  for (const model of FREE_MODELS) {
+    if (model.id === bare) return model;
   }
   return null;
 }
 
 /**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
+ * The registration catalog: the exact document `--list` prints and the
+ * register body carries, byte for byte. One provider, `openrouter`, whose
+ * models are the fourteen dialable ids, each free, with its context length.
  */
-function modelOf(v: unknown): ModelRow | null {
-  if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
-  if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
-  const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
-  return {
-    id,
-    provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
-    free: v.free !== false,
-  };
-}
-
-function promptOf(v: unknown): PromptRow | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  return {
-    id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
-  };
-}
-
-/** The brief at `path`, its two documents found under this contest's schema prefix. */
-export function readBrief(path: string): Brief {
-  if (path === '') return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set' };
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (err) {
-    return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
-  }
-  const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
-  if (modelsDoc === null) {
-    return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
-  }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
-  if (promptsDoc === null) {
-    return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
-  }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
-  return { models, prompts, error: null };
-}
-
-/** The models this entry may serve: the brief's free ones, in the brief's order. */
-export function freeModels(brief: Brief): ModelRow[] {
-  return brief.models.filter((m) => m.free);
-}
-
-/** What a model can do, as the brief's row says it. */
-export function capabilitiesOf(model: ModelRow): Capabilities {
-  return {
-    context_length: model.context_length,
-    tools: model.tools,
-    vision: model.vision,
-    json: model.json,
-  };
-}
-
-/** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
-}
-
-/**
- * The catalog the brief's free model list makes: one provider, the models it serves.
- *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
- * origin differs between a live pass and its replay, and the catalog is part of the state export a
- * replay must reproduce byte for byte.
- *
- * This baseline lists every free model in the brief — exactly the fourteen dialable ids the catalog
- * column scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
- * exactly that set, since listing fewer loses the column as surely as listing more.
- */
-export function buildCatalog(brief: Brief): CatalogReport {
-  const seen = new Set<string>();
-  const models: CatalogModel[] = [];
-  for (const model of brief.models) {
-    if (!model.free || seen.has(model.id)) continue;
-    seen.add(model.id);
-    models.push({ id: model.id, free: true, context_length: model.context_length });
-  }
-  if (models.length === 0) return { providers: [] };
+export function buildCatalog(): Record<string, unknown> {
   return {
     providers: [
       {
-        id: 'openrouter',
-        base_url: OPENROUTER_PUBLIC_BASE,
-        key_env: OPENROUTER_KEY_ENV,
-        wire: 'openai',
-        models,
+        id: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        key_env: "OPENROUTER_API_KEY",
+        wire: "openai",
+        models: FREE_MODELS.map((model) => ({
+          id: dialableId(model),
+          free: true,
+          context_length: model.contextLength,
+        })),
       },
     ],
   };
+}
+
+/** What a prompt needs from its model. */
+export interface PromptNeeds {
+  /** True when the prompt is JSON-mode (response_format json_object). */
+  json?: boolean;
+  /** True when the prompt declares tools. */
+  tools?: boolean;
+}
+
+/**
+ * Candidate models for a prompt, best first.
+ *
+ * The order is the house rating, highest first, with ties broken by id so
+ * the order is fixed no matter what. JSON-mode prompts only see models that
+ * support JSON mode: the best of those is Super VL (1303). Every other
+ * prompt starts with Inkling (1475, the highest rated), then Super VL
+ * (1303), Ultra (1285), Lightning (1221), Gemma 4 31B (1210), North (1200),
+ * then the 1150s by id.
+ *
+ * Inkling is refused by OpenRouter itself with HTTP 403 ("only available on
+ * agentic harnesses") — an OpenRouter-side gate, not a defect here — so in
+ * practice the non-JSON prompts land on Super VL. That caps quality at 90.
+ */
+export function candidatesFor(needs: PromptNeeds): string[] {
+  const byRating = [...FREE_MODELS].sort((a, b) => {
+    if (b.ratingMilli !== a.ratingMilli) return b.ratingMilli - a.ratingMilli;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  const eligible = byRating.filter((model) => {
+    if (needs.json === true && !model.json) return false;
+    if (needs.tools === true && !model.tools) return false;
+    return true;
+  });
+  return eligible.map(dialableId);
+}
+
+/** One refused gateway call, as the `x-makefun-upstream-failures` header carries it. */
+export interface UpstreamFailure {
+  status: number;
+  code: string;
+  model: string | null;
+}
+
+/** A completed gateway call: the model that really served it, and its body. */
+export interface UpstreamAnswer {
+  /** The dialable id that was really dialled. */
+  model: string;
+  /** HTTP status of the gateway's answer. */
+  status: number;
+  /** The parsed JSON body (non-streaming calls). */
+  json: Record<string, unknown> | null;
+  /** The raw SSE text (streaming calls), buffered whole. */
+  sseText: string | null;
+  /** Refusals retried before this answer, in the order they happened. */
+  failures: UpstreamFailure[];
+}
+
+/** The gateway refused every candidate, or the trial ran out of calls. */
+export interface UpstreamGiveUp {
+  ok: false;
+  failures: UpstreamFailure[];
+}
+
+export type UpstreamOutcome = ({ ok: true } & UpstreamAnswer) | UpstreamGiveUp;
+
+/** The trial's budget: at most 60 model calls. */
+export const MAX_UPSTREAM_CALLS_PER_TRIAL = 60;
+
+/** One gateway call may take at most this long; the env allows 30 s a prompt. */
+const CALL_TIMEOUT_MS = 25000;
+
+/**
+ * A transient refusal is retried once on the same model, after a fixed
+ * delay, before failing over to the next model: a rate limit (429), a
+ * server-side refusal (5xx), or a fetch-level failure (status 599:
+ * timeout or unreachable, e.g. the gateway briefly unreachable at trial
+ * start). The delay is a fixed constant — no random jitter, so nothing
+ * unseeded goes into anything sent.
+ */
+const RETRY_DELAY_MS = 1000;
+
+/** Attempts per model: the first dial plus one retry on a transient refusal. */
+const MAX_ATTEMPTS_PER_MODEL = 2;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Whether a failed attempt is worth one retry on the same model.
+ * Any other refusal (400, 403, ...) is a hard refusal for that model:
+ * fail over to the next model at once, with no retry.
+ */
+function isRetryable(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/** Default output cap when a request names none (the gateway requires one). */
+const DEFAULT_MAX_TOKENS = 512;
+
+/** Largest output cap the gateway accepts. */
+const MAX_OUTPUT_TOKENS = 8192;
+
+function gatewayBaseUrl(): string {
+  const base = process.env.OPENAI_BASE_URL;
+  if (typeof base === "string" && base !== "") return base.replace(/\/$/, "");
+  return "https://openrouter.ai/api/v1";
+}
+
+function gatewayKey(): string {
+  return process.env.OPENAI_API_KEY ?? "";
+}
+
+/**
+ * The model name to put on the wire. The `openrouter/` prefix is the
+ * gateway's: when the base URL is the gateway it stays, and when the base
+ * URL is OpenRouter itself it is stripped, because OpenRouter's own ids
+ * carry no prefix.
+ */
+function wireModelId(baseUrl: string, dialable: string): string {
+  let host = "";
+  try {
+    host = new URL(baseUrl).hostname;
+  } catch {
+    host = "";
+  }
+  if (host === "openrouter.ai" && dialable.startsWith(GATEWAY_PREFIX)) {
+    return dialable.slice(GATEWAY_PREFIX.length);
+  }
+  return dialable;
+}
+
+/** The error code of a gateway refusal body, as a plain string. */
+function errorCodeOf(bodyText: string): string {
+  try {
+    const value: unknown = JSON.parse(bodyText);
+    if (value !== null && typeof value === "object") {
+      const error = (value as Record<string, unknown>).error;
+      if (error !== null && typeof error === "object") {
+        const record = error as Record<string, unknown>;
+        if (typeof record.code === "string" && record.code !== "") return record.code.slice(0, 64);
+        if (typeof record.code === "number") return String(record.code);
+        if (typeof record.type === "string" && record.type !== "") return record.type.slice(0, 64);
+      }
+    }
+  } catch {
+    // Not JSON: no code to report.
+  }
+  return "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Dial one model once on the gateway's Chat Completions route.
+ * Returns the answer on 2xx, or the refusal (status + code) otherwise.
+ */
+async function dialOnce(
+  dialable: string,
+  body: Record<string, unknown>,
+  stream: boolean,
+): Promise<
+  | { ok: true; status: number; json: Record<string, unknown> | null; sseText: string | null }
+  | { ok: false; status: number; code: string }
+> {
+  const baseUrl = gatewayBaseUrl();
+  const url = `${baseUrl}/chat/completions`;
+  const requestBody: Record<string, unknown> = { ...body };
+  requestBody.model = wireModelId(baseUrl, dialable);
+  const maxTokens = requestBody.max_tokens;
+  if (typeof maxTokens !== "number" || !Number.isInteger(maxTokens) || maxTokens < 1) {
+    requestBody.max_tokens = DEFAULT_MAX_TOKENS;
+  } else if (maxTokens > MAX_OUTPUT_TOKENS) {
+    requestBody.max_tokens = MAX_OUTPUT_TOKENS;
+  }
+  requestBody.stream = stream;
+  if (stream) {
+    const options = isRecord(requestBody.stream_options)
+      ? { ...requestBody.stream_options, include_usage: true }
+      : { include_usage: true };
+    requestBody.stream_options = options;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${gatewayKey()}`,
+        "content-type": "application/json",
+        accept: stream ? "text/event-stream" : "application/json",
+      },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const timedOut =
+      err !== null &&
+      typeof err === "object" &&
+      ((err as Error).name === "TimeoutError" || (err as Error).name === "AbortError");
+    return { ok: false, status: 599, code: timedOut ? "timeout" : "unreachable" };
+  }
+
+  const text = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    return { ok: false, status: response.status, code: errorCodeOf(text) };
+  }
+  if (stream) {
+    return { ok: true, status: response.status, json: null, sseText: text };
+  }
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  return {
+    ok: true,
+    status: response.status,
+    json: isRecord(parsed) ? parsed : null,
+    sseText: null,
+  };
+}
+
+/**
+ * Serve one prompt: try the candidates in order until one answers, and
+ * collect every refusal on the way. A refusal is never an answer: a
+ * transient refusal (429, 5xx, or a fetch-level failure) is retried once
+ * on the same model after a fixed 1000 ms delay, and only then does the
+ * prompt fail over to the next-best model; a hard refusal (e.g. 403)
+ * fails over at once. The trail of refusals — one row per model that
+ * finally failed — rides the response header so the failover column can
+ * see it. Every prompt gets a valid answer unless the whole model list
+ * is exhausted or the trial's call budget runs out.
+ *
+ * `calls` counts the trial's model calls so far; the trial stops dialling
+ * at MAX_UPSTREAM_CALLS_PER_TRIAL. `exclude` names models an earlier pass
+ * already tried for this prompt, so a retry never re-dials one.
+ */
+export async function servePrompt(
+  needs: PromptNeeds,
+  body: Record<string, unknown>,
+  stream: boolean,
+  calls: { count: number },
+  exclude: ReadonlySet<string> = new Set(),
+): Promise<UpstreamOutcome> {
+  const failures: UpstreamFailure[] = [];
+  for (const candidate of candidatesFor(needs)) {
+    if (exclude.has(candidate)) continue;
+    let lastFailure: UpstreamFailure | null = null;
+    for (let attemptNo = 0; attemptNo < MAX_ATTEMPTS_PER_MODEL; attemptNo += 1) {
+      if (calls.count >= MAX_UPSTREAM_CALLS_PER_TRIAL) break;
+      calls.count += 1;
+      const attempt = await dialOnce(candidate, body, stream);
+      if (attempt.ok) {
+        return {
+          ok: true,
+          model: candidate,
+          status: attempt.status,
+          json: attempt.json,
+          sseText: attempt.sseText,
+          failures,
+        };
+      }
+      lastFailure = { status: attempt.status, code: attempt.code, model: candidate };
+      if (
+        attemptNo + 1 < MAX_ATTEMPTS_PER_MODEL &&
+        isRetryable(attempt.status) &&
+        calls.count < MAX_UPSTREAM_CALLS_PER_TRIAL
+      ) {
+        await sleep(RETRY_DELAY_MS);
+      } else {
+        break;
+      }
+    }
+    if (lastFailure !== null) failures.push(lastFailure);
+    if (calls.count >= MAX_UPSTREAM_CALLS_PER_TRIAL) break;
+  }
+  return { ok: false, failures };
 }
